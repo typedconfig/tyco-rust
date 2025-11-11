@@ -9,7 +9,7 @@ use regex::Regex;
 
 use crate::{
     context::{FieldSchema, TycoContext, TycoStruct},
-    error::TycoError,
+    error::{SourceSpan, TycoError},
     utils::{
         has_unclosed_delimiter, normalize_datetime, normalize_time, parse_integer, split_top_level,
         strip_inline_comment, strip_leading_newline, unescape_basic_string,
@@ -35,6 +35,41 @@ enum ParseState {
     TopLevel,
     InStructSchema,
     InStructInstances,
+}
+
+#[derive(Clone, Debug)]
+struct SourceLine {
+    text: String,
+    path: Option<PathBuf>,
+    line_number: usize,
+}
+
+impl SourceLine {
+    fn new(text: String, path: Option<PathBuf>, line_number: usize) -> Self {
+        Self {
+            text,
+            path,
+            line_number,
+        }
+    }
+
+    fn span(&self) -> SourceSpan {
+        SourceSpan {
+            path: self.path.clone(),
+            line: self.line_number,
+            column: 1,
+            line_text: self.text.clone(),
+        }
+    }
+
+    fn span_at_column(&self, column: usize) -> SourceSpan {
+        SourceSpan {
+            path: self.path.clone(),
+            line: self.line_number,
+            column,
+            line_text: self.text.clone(),
+        }
+    }
 }
 
 pub struct TycoParser {
@@ -66,12 +101,13 @@ impl TycoParser {
     pub fn parse_str(&mut self, content: &str) -> Result<TycoContext, TycoError> {
         let lines = content
             .lines()
-            .map(|line| line.to_string())
+            .enumerate()
+            .map(|(idx, line)| SourceLine::new(line.to_string(), None, idx + 1))
             .collect::<Vec<_>>();
         self.parse_lines(&lines)
     }
 
-    fn read_file_with_includes(&mut self, path: &Path) -> Result<Vec<String>, TycoError> {
+    fn read_file_with_includes(&mut self, path: &Path) -> Result<Vec<SourceLine>, TycoError> {
         let canonical = fs::canonicalize(path)?;
         if !self.included.insert(canonical.clone()) {
             return Ok(Vec::new());
@@ -82,20 +118,24 @@ impl TycoParser {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        for line in content.lines() {
+        for (idx, line) in content.lines().enumerate() {
+            let source_line =
+                SourceLine::new(line.to_string(), Some(canonical.clone()), idx + 1);
             if let Some(include_path) = line.trim().strip_prefix("#include") {
-                let include = include_path.trim().trim_matches(['"', '\''].as_ref());
+                let include = include_path.trim().trim_matches(|c| c == '"' || c == '\'');
                 let include_full = parent.join(include);
-                let nested = self.read_file_with_includes(&include_full)?;
-                result.extend(nested);
+                match self.read_file_with_includes(&include_full) {
+                    Ok(nested) => result.extend(nested),
+                    Err(err) => return Err(err.with_span(source_line.span())),
+                }
             } else {
-                result.push(line.to_string());
+                result.push(source_line);
             }
         }
         Ok(result)
     }
 
-    fn parse_lines(&mut self, lines: &[String]) -> Result<TycoContext, TycoError> {
+    fn parse_lines(&mut self, lines: &[SourceLine]) -> Result<TycoContext, TycoError> {
         let mut context = TycoContext::new();
         let mut state = ParseState::TopLevel;
         let mut current_struct: Option<String> = None;
@@ -104,7 +144,7 @@ impl TycoParser {
         let mut idx = 0;
         while idx < lines.len() {
             let line = &lines[idx];
-            let trimmed = strip_inline_comment(line);
+            let trimmed = strip_inline_comment(&line.text);
             let trimmed_ws = trimmed.trim();
 
             if trimmed_ws.is_empty() {
@@ -128,13 +168,15 @@ impl TycoParser {
                 continue;
             }
 
-            if let Some(caps) = FIELD_RE.captures(line) {
+            if let Some(caps) = FIELD_RE.captures(&line.text) {
                 let is_primary = caps.get(1).map_or(false, |m| m.as_str() == "*");
                 let is_nullable = caps.get(1).map_or(false, |m| m.as_str() == "?");
                 let type_name = caps[2].to_string();
                 let is_array = caps.get(3).is_some();
                 let attr_name = caps[4].to_string();
-                let mut value_str = caps.get(5).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let mut value_str =
+                    caps.get(5).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let line_span = line.span();
 
                 if has_unclosed_delimiter(&value_str, "\"\"\"")
                     || has_unclosed_delimiter(&value_str, "'''")
@@ -149,9 +191,12 @@ impl TycoParser {
 
                 value_str = strip_inline_comment(&value_str);
 
-                let is_global_line = line.chars().next().map_or(false, |c| !c.is_whitespace());
+                let is_global_line = line.text.chars().next().map_or(false, |c| !c.is_whitespace());
                 if !is_global_line && current_struct.is_none() {
-                    return Err(TycoError::parse("Struct field defined before struct header"));
+                    return Err(
+                        TycoError::parse("Struct field defined before struct header")
+                            .with_span(line_span.clone()),
+                    );
                 }
 
                 if !is_global_line {
@@ -162,7 +207,8 @@ impl TycoParser {
                     field.is_array = is_array;
                     if !value_str.is_empty() {
                         let ty = field_type_name(&field);
-                        let parsed = self.parse_value(&value_str, &ty, &context)?;
+                        let parsed =
+                            self.parse_value(&value_str, &ty, &context, &line_span)?;
                         field.default_value = Some(parsed);
                     }
                     context
@@ -173,7 +219,7 @@ impl TycoParser {
                 } else {
                     let type_descriptor = field_type_descriptor(&type_name, is_array);
                     let value =
-                        self.parse_value(&value_str, &type_descriptor, &context)?;
+                        self.parse_value(&value_str, &type_descriptor, &context, &line_span)?;
                     context.set_global(attr_name, value);
                     state = ParseState::TopLevel;
                 }
@@ -181,10 +227,11 @@ impl TycoParser {
                 continue;
             }
 
-            if let Some(caps) = DEFAULT_UPDATE_RE.captures(line) {
+            if let Some(caps) = DEFAULT_UPDATE_RE.captures(&line.text) {
                 if let Some(struct_name) = &current_struct {
                     let field_name = caps[1].to_string();
                     let mut value_str = caps.get(2).map(|m| m.as_str().to_string()).unwrap_or_default();
+                    let value_span = line.span();
                     if has_unclosed_delimiter(&value_str, "\"\"\"")
                         || has_unclosed_delimiter(&value_str, "'''")
                     {
@@ -207,9 +254,12 @@ impl TycoParser {
                             .fields()
                             .iter()
                             .find(|field| field.name == field_name)
-                            .ok_or_else(|| TycoError::parse(format!("Unknown field '{field_name}'")))?;
+                            .ok_or_else(|| {
+                                TycoError::parse(format!("Unknown field '{field_name}'"))
+                                    .with_span(value_span.clone())
+                            })?;
                         let ty = field_type_name(field_schema);
-                        Some(self.parse_value(&value_str, &ty, &context)?)
+                        Some(self.parse_value(&value_str, &ty, &context, &value_span)?)
                     };
 
                     context
@@ -223,9 +273,12 @@ impl TycoParser {
 
             if trimmed_ws.starts_with('-') {
                 if current_struct.is_none() {
-                    return Err(TycoError::parse(
-                        "Instance data encountered outside of a struct block",
-                    ));
+                    return Err(
+                        TycoError::parse(
+                            "Instance data encountered outside of a struct block",
+                        )
+                        .with_span(line.span()),
+                    );
                 }
                 state = ParseState::InStructInstances;
                 let mut inst_line = trimmed_ws.trim_start_matches('-').trim().to_string();
@@ -233,7 +286,7 @@ impl TycoParser {
                     inst_line.pop();
                     idx += 1;
                     inst_line.push(' ');
-                    inst_line.push_str(strip_inline_comment(&lines[idx]).trim());
+                    inst_line.push_str(strip_inline_comment(&lines[idx].text).trim());
                 }
                 if has_unclosed_delimiter(&inst_line, "\"\"\"") || has_unclosed_delimiter(&inst_line, "'''") {
                     let delimiter = if inst_line.contains("\"\"\"") {
@@ -249,7 +302,7 @@ impl TycoParser {
             }
 
             if state == ParseState::InStructInstances
-                && line.chars().next().map_or(false, |c| c.is_whitespace())
+                && line.text.chars().next().map_or(false, |c| c.is_whitespace())
             {
                 if let Some(last) = instance_lines.last_mut() {
                     last.push(' ');
@@ -274,7 +327,7 @@ impl TycoParser {
 
     fn accumulate_multiline(
         idx: usize,
-        lines: &[String],
+        lines: &[SourceLine],
         value_str: &mut String,
         delimiter: &str,
     ) -> usize {
@@ -282,7 +335,7 @@ impl TycoParser {
         while cursor + 1 < lines.len() && has_unclosed_delimiter(value_str, delimiter) {
             cursor += 1;
             value_str.push('\n');
-            value_str.push_str(&lines[cursor]);
+            value_str.push_str(&lines[cursor].text);
             if !has_unclosed_delimiter(value_str, delimiter) {
                 break;
             }
@@ -311,6 +364,12 @@ impl TycoParser {
             let mut instance = TycoInstance::new(struct_name);
             let mut positional_index = 0;
             let mut using_named = false;
+            let line_span = SourceSpan {
+                path: None,
+                line: 0,
+                column: 1,
+                line_text: line.clone(),
+            };
             for part in parts {
                 let part = part.trim();
                 if part.is_empty() {
@@ -321,24 +380,31 @@ impl TycoParser {
                     let schema = fields
                         .iter()
                         .find(|f| f.name == field)
-                        .ok_or_else(|| TycoError::parse(format!("Unknown field '{field}' in {struct_name}")))?;
+                        .ok_or_else(|| TycoError::parse(format!("Unknown field '{field}' in {struct_name}")).with_span(line_span.clone()))?;
                     let ty = field_type_name(schema);
-                    let typed_value = self.parse_value(value.trim(), &ty, context)?;
+                    let typed_value =
+                        self.parse_value(value.trim(), &ty, context, &line_span)?;
                     instance.set_attribute(field.to_string(), typed_value);
                 } else {
                     if using_named {
-                        return Err(TycoError::parse(
-                            "Positional arguments cannot follow named arguments",
-                        ));
+                        return Err(
+                            TycoError::parse(
+                                "Positional arguments cannot follow named arguments",
+                            )
+                            .with_span(line_span.clone()),
+                        );
                     }
                     if positional_index >= fields.len() {
-                        return Err(TycoError::parse(format!(
-                            "Too many positional arguments for {struct_name}"
-                        )));
+                        return Err(
+                            TycoError::parse(format!(
+                                "Too many positional arguments for {struct_name}"
+                            ))
+                            .with_span(line_span.clone()),
+                        );
                     }
                     let schema = &fields[positional_index];
                     let ty = field_type_name(schema);
-                    let typed_value = self.parse_value(part, &ty, context)?;
+                    let typed_value = self.parse_value(part, &ty, context, &line_span)?;
                     instance.set_attribute(schema.name.clone(), typed_value);
                     positional_index += 1;
                 }
@@ -395,6 +461,7 @@ impl TycoParser {
         token: &str,
         type_name: &str,
         context: &TycoContext,
+        span: &SourceSpan,
     ) -> Result<TycoValue, TycoError> {
         let trimmed = token.trim();
         if trimmed.eq_ignore_ascii_case("null") {
@@ -407,13 +474,19 @@ impl TycoParser {
                 } else if trimmed == "false" {
                     Ok(TycoValue::Bool(false))
                 } else {
-                    Err(TycoError::parse(format!("Invalid bool literal '{trimmed}'")))
+                    Err(
+                        TycoError::parse(format!("Invalid bool literal '{trimmed}'"))
+                            .with_span(span.clone()),
+                    )
                 }
             }
-            "int" => Ok(TycoValue::Int(parse_integer(trimmed)?)),
+            "int" => Ok(TycoValue::Int(
+                parse_integer(trimmed).map_err(|e| e.with_span(span.clone()))?,
+            )),
             "float" => {
                 let value = trimmed.parse::<f64>().map_err(|e| {
                     TycoError::parse(format!("Invalid float literal '{trimmed}': {e}"))
+                        .with_span(span.clone())
                 })?;
                 Ok(TycoValue::Float(value))
             }
@@ -429,9 +502,12 @@ impl TycoParser {
                     return Ok(TycoValue::Array(Vec::new()));
                 }
                 if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
-                    return Err(TycoError::parse(format!(
-                        "Array literal must be wrapped in []: {trimmed}"
-                    )));
+                    return Err(
+                        TycoError::parse(format!(
+                            "Array literal must be wrapped in []: {trimmed}"
+                        ))
+                        .with_span(span.clone()),
+                    );
                 }
                 let inner = &trimmed[1..trimmed.len() - 1];
                 let items = split_top_level(inner, ',');
@@ -440,11 +516,11 @@ impl TycoParser {
                     if item.trim().is_empty() {
                         continue;
                     }
-                    values.push(self.parse_value(item.trim(), base, context)?);
+                    values.push(self.parse_value(item.trim(), base, context, span)?);
                 }
                 Ok(TycoValue::Array(values))
             }
-            _ => self.parse_struct_call(trimmed, type_name, context),
+            _ => self.parse_struct_call(trimmed, type_name, context, span),
         }
     }
 
@@ -453,6 +529,7 @@ impl TycoParser {
         token: &str,
         type_name: &str,
         context: &TycoContext,
+        span: &SourceSpan,
     ) -> Result<TycoValue, TycoError> {
         if let Some(caps) = STRUCT_CALL_RE.captures(token) {
             let struct_name = caps[1].to_string();
@@ -472,9 +549,12 @@ impl TycoParser {
                 }
             }
         }
-        Err(TycoError::parse(format!(
-            "Cannot parse value '{token}' as type '{type_name}'"
-        )))
+        Err(
+            TycoError::parse(format!(
+                "Cannot parse value '{token}' as type '{type_name}'"
+            ))
+            .with_span(span.clone()),
+        )
     }
 
     fn parse_inline_instance(

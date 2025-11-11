@@ -1,0 +1,17 @@
+# Example Tyco configuration
+str project: demo
+bool debug: true
+
+Host:
+ *str name:
+  int cores:
+  bool enabled: false
+  - host1, cores: 4, enabled: true
+  - host2, cores: 8
+
+Application:
+ *str name:
+  Host host:
+  str description:
+  - "app1", Host(host1), description: "Demo application"
+  - "app2", Host(host2), description: "Second service"

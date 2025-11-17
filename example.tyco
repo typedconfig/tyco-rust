@@ -1,17 +1,25 @@
-# Example Tyco configuration
-str project: demo
-bool debug: true
+str timezone: UTC  # this is a global config setting
+
+Application:       # schema defined first, followed by instance creation
+  str service:
+  str profile:
+  str command: start_app {service}.{profile} -p {port.number}
+  Host host:
+  Port port: Port(http_web)  # reference to Port instance defined below
+  - service: webserver, profile: primary, host: Host(prod-01-us)
+  - service: webserver, profile: backup,  host: Host(prod-02-us)
+  - service: database,  profile: mysql,   host: Host(prod-02-us), port: Port(http_mysql)
 
 Host:
- *str name:
+ *str hostname:  # star character (*) used as reference primary key
   int cores:
-  bool enabled: false
-  - host1, cores: 4, enabled: true
-  - host2, cores: 8
+  bool hyperthreaded: true
+  str os: Debian
+  - prod-01-us, cores: 64, hyperthreaded: false
+  - prod-02-us, cores: 32, os: Fedora
 
-Application:
+Port:
  *str name:
-  Host host:
-  str description:
-  - "app1", Host(host1), description: "Demo application"
-  - "app2", Host(host2), description: "Second service"
+  int number:
+  - http_web,   80  # can skip field keys when obvious
+  - http_mysql, 3306

@@ -14,7 +14,7 @@ use tyco_rust::{load, TycoError};
 
 fn main() -> Result<(), TycoError> {
     let context = load("tyco/example.tyco")?;
-    let document = context.to_json();
+    let document = context.to_object();
 
     let environment = document["environment"].as_str().unwrap_or_default();
     let debug = document["debug"].as_bool().unwrap_or(false);
@@ -34,7 +34,7 @@ fn main() -> Result<(), TycoError> {
 ```
 
 Run the parser against other files with `tyco_rust::loads(&content)`; both entrypoints return a
-fully-rendered `TycoContext`, so calling `to_json()` yields the same structure as the Python
+fully-rendered `TycoContext`, so calling `to_object()` (or the legacy `to_json()`) yields the same structure as the Python
 example.
 
 ## Testing

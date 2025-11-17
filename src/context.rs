@@ -407,4 +407,8 @@ impl TycoContext {
         }
         JsonValue::Object(map)
     }
+
+    pub fn to_object(&self) -> JsonValue {
+        self.to_json()
+    }
 }

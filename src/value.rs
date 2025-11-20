@@ -1,5 +1,6 @@
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
+use std::{borrow::Cow, collections::VecDeque};
 
 use crate::{context::TycoContext, utils::unescape_basic_string};
 
@@ -59,41 +60,118 @@ fn resolve_placeholder(
     ctx: &TycoContext,
     current: Option<&TycoInstance>,
 ) -> Option<String> {
+    fn resolve_from_instance<'a>(
+        instance: &'a TycoInstance,
+        parts: &[&'a str],
+    ) -> Option<&'a TycoValue> {
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut queue: VecDeque<Cow<'_, str>> =
+            parts.iter().map(|part| Cow::Borrowed(*part)).collect();
+        let mut current_container: Option<&TycoInstance> = Some(instance);
+        let mut current_value: Option<&TycoValue> = None;
+
+        while !queue.is_empty() {
+            let container = current_container?;
+            let attr_name = queue.front().cloned().unwrap();
+
+            if let Some(value) = container.get_attribute(attr_name.as_ref()) {
+                queue.pop_front();
+                current_value = Some(value);
+
+                if queue.is_empty() {
+                    return current_value;
+                }
+
+                current_container = match value {
+                    TycoValue::Instance(inst) => Some(inst),
+                    TycoValue::Reference(reference) => reference.resolved.as_deref(),
+                    _ => return None,
+                };
+            } else if queue.len() > 1 {
+                let first = queue.pop_front().unwrap();
+                let second = queue.pop_front().unwrap();
+                queue.push_front(Cow::Owned(format!(
+                    "{}.{}",
+                    first.as_ref(),
+                    second.as_ref()
+                )));
+            } else {
+                return None;
+            }
+        }
+
+        current_value
+    }
+
+    fn resolve_from_globals<'a>(
+        ctx: &'a TycoContext,
+        parts: &[&'a str],
+    ) -> Option<&'a TycoValue> {
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut queue: VecDeque<Cow<'_, str>> =
+            parts.iter().map(|part| Cow::Borrowed(*part)).collect();
+        let mut current_container: Option<&TycoInstance> = None;
+        let mut current_value: Option<&TycoValue> = None;
+
+        while !queue.is_empty() {
+            let attr_name = queue.front().cloned().unwrap();
+
+            if let Some(container) = current_container {
+                current_value = container.get_attribute(attr_name.as_ref());
+            } else {
+                current_value = ctx.globals().get(attr_name.as_ref());
+            }
+
+            if let Some(value) = current_value {
+                queue.pop_front();
+
+                if queue.is_empty() {
+                    return Some(value);
+                }
+
+                current_container = match value {
+                    TycoValue::Instance(inst) => Some(inst),
+                    TycoValue::Reference(reference) => reference.resolved.as_deref(),
+                    _ => return None,
+                };
+            } else if queue.len() > 1 {
+                let first = queue.pop_front().unwrap();
+                let second = queue.pop_front().unwrap();
+                queue.push_front(Cow::Owned(format!(
+                    "{}.{}",
+                    first.as_ref(),
+                    second.as_ref()
+                )));
+            } else {
+                return None;
+            }
+        }
+
+        current_value
+    }
+
     let path_parts: Vec<&str> = placeholder.split('.').collect();
     if path_parts.is_empty() {
         return None;
     }
 
-    let mut segments = path_parts.as_slice();
-    let mut from_global = false;
-    if placeholder.starts_with("global.") && segments.len() > 1 {
-        segments = &segments[1..];
-        from_global = true;
+    let mut value = current.and_then(|instance| resolve_from_instance(instance, &path_parts));
+
+    if value.is_none() && path_parts.len() > 1 && path_parts[0] == "global" {
+        value = resolve_from_globals(ctx, &path_parts[1..]);
     }
 
-    let first = segments.first()?;
-    let mut value = if from_global {
-        ctx.globals().get(*first)
-    } else if let Some(instance) = current {
-        instance
-            .get_attribute(first)
-            .or_else(|| ctx.globals().get(*first))
-    } else {
-        ctx.globals().get(*first)
-    }?;
-
-    for segment in segments.iter().skip(1) {
-        value = match value {
-            TycoValue::Instance(instance) => instance.get_attribute(segment),
-            TycoValue::Reference(reference) => reference
-                .resolved
-                .as_ref()
-                .and_then(|inst| inst.get_attribute(segment)),
-            _ => return None,
-        }?;
+    if value.is_none() {
+        value = resolve_from_globals(ctx, &path_parts);
     }
 
-    Some(value.to_template_text())
+    value.map(TycoValue::to_template_text)
 }
 
 #[derive(Clone, Debug)]

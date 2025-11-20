@@ -21,12 +21,13 @@ static STRUCT_DEF_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([A-Z][A-Za-z0-9_]*)\s*:$").unwrap());
 static FIELD_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"^\s*([*?])?([A-Za-z][A-Za-z0-9_]*)(\[\])?\s+([a-z_][A-Za-z0-9_]*)\s*:(?:\s+(.*))?$",
+        r"^\s*([*?])?([A-Za-z][A-Za-z0-9_]*)(\[\])?\s+([a-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*:(?:\s+(.*))?$",
     )
     .unwrap()
 });
-static DEFAULT_UPDATE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s+([a-z_][A-Za-z0-9_]*)\s*:(?:\s+(.*))?$").unwrap());
+static DEFAULT_UPDATE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s+([a-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*)\s*:(?:\s+(.*))?$").unwrap()
+});
 static STRUCT_CALL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([A-Za-z][A-Za-z0-9_]*)\((.*)\)$").unwrap());
 
@@ -87,7 +88,7 @@ impl TycoParser {
         let mut chars = name.chars();
         match chars.next() {
             Some(first) if first.is_ascii_alphabetic() || first == '_' => {
-                chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
             }
             _ => false,
         }

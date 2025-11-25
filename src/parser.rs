@@ -11,8 +11,9 @@ use crate::{
     context::{FieldSchema, TycoContext, TycoStruct},
     error::{SourceSpan, TycoError},
     utils::{
-        has_unclosed_delimiter, normalize_datetime, normalize_time, parse_integer, split_top_level,
-        strip_inline_comment, strip_leading_newline, unescape_basic_string,
+        has_unclosed_delimiter, has_unclosed_parentheses, normalize_datetime, normalize_time,
+        parse_integer, split_top_level, strip_inline_comment, strip_leading_newline,
+        unescape_basic_string,
     },
     value::{TycoInstance, TycoReference, TycoString, TycoValue},
 };
@@ -30,6 +31,7 @@ static DEFAULT_UPDATE_RE: Lazy<Regex> = Lazy::new(|| {
 });
 static STRUCT_CALL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^([A-Za-z][A-Za-z0-9_]*)\((.*)\)$").unwrap());
+const SCALAR_TYPE_LIST: &str = "bool, int, float, str, date, time, datetime";
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ParseState {
@@ -63,14 +65,6 @@ impl SourceLine {
         }
     }
 
-    fn span_at_column(&self, column: usize) -> SourceSpan {
-        SourceSpan {
-            path: self.path.clone(),
-            line: self.line_number,
-            column,
-            line_text: self.text.clone(),
-        }
-    }
 }
 
 pub struct TycoParser {
@@ -191,7 +185,18 @@ impl TycoParser {
                 }
 
                 value_str = strip_inline_comment(&value_str);
-
+                let mut trimmed_default = value_str.trim().to_string();
+                if trimmed_default.starts_with('(') && has_unclosed_parentheses(&trimmed_default) {
+                    idx = Self::accumulate_enum_list(idx, lines, &mut value_str);
+                    value_str = strip_inline_comment(&value_str);
+                    trimmed_default = value_str.trim().to_string();
+                    if has_unclosed_parentheses(&trimmed_default) {
+                        return Err(
+                            TycoError::parse("Unterminated enum declaration")
+                                .with_span(line_span.clone()),
+                        );
+                    }
+                }
                 let is_global_line = line.text.chars().next().map_or(false, |c| !c.is_whitespace());
                 if !is_global_line && current_struct.is_none() {
                     return Err(
@@ -206,11 +211,36 @@ impl TycoParser {
                     field.is_primary_key = is_primary;
                     field.is_nullable = is_nullable;
                     field.is_array = is_array;
-                    if !value_str.is_empty() {
-                        let ty = field_type_name(&field);
-                        let parsed =
-                            self.parse_value(&value_str, &ty, &context, &line_span)?;
-                        field.default_value = Some(parsed);
+                    if !trimmed_default.is_empty() {
+                        if trimmed_default.starts_with('(') {
+                            if is_array {
+                                return Err(
+                                    TycoError::parse(
+                                        "Enum constraints are only supported on scalar fields",
+                                    )
+                                    .with_span(line_span.clone()),
+                                );
+                            }
+                            if !is_scalar_type(&type_name) {
+                                return Err(
+                                    TycoError::parse(format!(
+                                        "Can only set enum values on {SCALAR_TYPE_LIST}"
+                                    ))
+                                    .with_span(line_span.clone()),
+                                );
+                            }
+                            let choices = self.parse_enum_choices(
+                                &trimmed_default,
+                                &type_name,
+                                &context,
+                                &line_span,
+                            )?;
+                            field.enum_choices = Some(choices);
+                        } else {
+                            let ty = field_type_name(&field);
+                            let parsed = self.parse_value(&trimmed_default, &ty, &context, &line_span)?;
+                            field.default_value = Some(parsed);
+                        }
                     }
                     context
                         .get_struct_mut(&struct_name)
@@ -220,7 +250,7 @@ impl TycoParser {
                 } else {
                     let type_descriptor = field_type_descriptor(&type_name, is_array);
                     let value =
-                        self.parse_value(&value_str, &type_descriptor, &context, &line_span)?;
+                        self.parse_value(&trimmed_default, &type_descriptor, &context, &line_span)?;
                     context.set_global(attr_name, value);
                     state = ParseState::TopLevel;
                 }
@@ -245,9 +275,22 @@ impl TycoParser {
                     }
 
                     value_str = strip_inline_comment(&value_str);
-                    let parsed_value = if value_str.trim().is_empty() {
-                        None
-                    } else {
+                    let mut trimmed_default = value_str.trim().to_string();
+                    if trimmed_default.starts_with('(')
+                        && has_unclosed_parentheses(&trimmed_default)
+                    {
+                        idx = Self::accumulate_enum_list(idx, lines, &mut value_str);
+                        value_str = strip_inline_comment(&value_str);
+                        trimmed_default = value_str.trim().to_string();
+                        if has_unclosed_parentheses(&trimmed_default) {
+                            return Err(
+                                TycoError::parse("Unterminated enum declaration")
+                                    .with_span(value_span.clone()),
+                            );
+                        }
+                    }
+
+                    let (field_type_name, is_array) = {
                         let schema = context
                             .get_struct(struct_name)
                             .ok_or_else(|| TycoError::UnknownStruct(struct_name.clone()))?;
@@ -259,14 +302,56 @@ impl TycoParser {
                                 TycoError::parse(format!("Unknown field '{field_name}'"))
                                     .with_span(value_span.clone())
                             })?;
-                        let ty = field_type_name(field_schema);
-                        Some(self.parse_value(&value_str, &ty, &context, &value_span)?)
+                        (field_schema.type_name.clone(), field_schema.is_array)
                     };
 
-                    context
-                        .get_struct_mut(struct_name)
-                        .ok_or_else(|| TycoError::UnknownStruct(struct_name.clone()))?
-                        .set_default(&field_name, parsed_value)?;
+                    if !trimmed_default.is_empty() {
+                        if trimmed_default.starts_with('(') {
+                            if is_array {
+                                return Err(
+                                    TycoError::parse(
+                                        "Enum constraints are only supported on scalar fields",
+                                    )
+                                    .with_span(value_span.clone()),
+                                );
+                            }
+                            if !is_scalar_type(&field_type_name) {
+                                return Err(
+                                    TycoError::parse(format!(
+                                        "Can only set enum values on {SCALAR_TYPE_LIST}"
+                                    ))
+                                    .with_span(value_span.clone()),
+                                );
+                            }
+                            let choices = self.parse_enum_choices(
+                                &trimmed_default,
+                                &field_type_name,
+                                &context,
+                                &value_span,
+                            )?;
+                            context
+                                .get_struct_mut(struct_name)
+                                .ok_or_else(|| TycoError::UnknownStruct(struct_name.clone()))?
+                                .set_enum_choices(&field_name, choices)
+                                .map_err(|err| err.with_span(value_span.clone()))?;
+                        } else {
+                            let descriptor =
+                                field_type_descriptor(&field_type_name, is_array);
+                            let value = self
+                                .parse_value(&trimmed_default, &descriptor, &context, &value_span)?;
+                            context
+                                .get_struct_mut(struct_name)
+                                .ok_or_else(|| TycoError::UnknownStruct(struct_name.clone()))?
+                                .set_default(&field_name, Some(value))
+                                .map_err(|err| err.with_span(value_span.clone()))?;
+                        }
+                    } else {
+                        context
+                            .get_struct_mut(struct_name)
+                            .ok_or_else(|| TycoError::UnknownStruct(struct_name.clone()))?
+                            .set_default(&field_name, None)
+                            .map_err(|err| err.with_span(value_span.clone()))?;
+                    }
                     idx += 1;
                     continue;
                 }
@@ -340,6 +425,22 @@ impl TycoParser {
             if !has_unclosed_delimiter(value_str, delimiter) {
                 break;
             }
+        }
+        cursor
+    }
+
+    fn accumulate_enum_list(
+        idx: usize,
+        lines: &[SourceLine],
+        value_str: &mut String,
+    ) -> usize {
+        let mut cursor = idx;
+        while cursor + 1 < lines.len()
+            && has_unclosed_parentheses(&strip_inline_comment(value_str))
+        {
+            cursor += 1;
+            value_str.push('\n');
+            value_str.push_str(&lines[cursor].text);
         }
         cursor
     }
@@ -525,6 +626,42 @@ impl TycoParser {
         }
     }
 
+    fn parse_enum_choices(
+        &self,
+        token: &str,
+        type_name: &str,
+        context: &TycoContext,
+        span: &SourceSpan,
+    ) -> Result<Vec<TycoValue>, TycoError> {
+        let trimmed = token.trim();
+        if trimmed.len() < 2 || !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return Err(
+                TycoError::parse("Enum choices must be enclosed in parentheses")
+                    .with_span(span.clone()),
+            );
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let parts = split_top_level(inner, ',');
+        if parts.is_empty() {
+            return Err(
+                TycoError::parse("Enum declaration must contain at least one choice")
+                    .with_span(span.clone()),
+            );
+        }
+        let mut choices = Vec::new();
+        for part in parts {
+            if part.trim().is_empty() {
+                return Err(
+                    TycoError::parse("Enum declaration must contain at least one choice")
+                        .with_span(span.clone()),
+                );
+            }
+            let parsed = self.parse_value(part.trim(), type_name, context, span)?;
+            choices.push(parsed);
+        }
+        Ok(choices)
+    }
+
     fn parse_struct_call(
         &self,
         token: &str,
@@ -604,6 +741,13 @@ fn field_type_descriptor(base: &str, is_array: bool) -> String {
     } else {
         base.to_string()
     }
+}
+
+fn is_scalar_type(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "bool" | "int" | "float" | "str" | "date" | "time" | "datetime"
+    )
 }
 
 fn parse_string_value(token: &str) -> Result<TycoString, TycoError> {

@@ -311,6 +311,20 @@ impl TycoValue {
         }
     }
 
+    pub fn value_equals(&self, other: &TycoValue) -> bool {
+        match (self, other) {
+            (TycoValue::Null, TycoValue::Null) => true,
+            (TycoValue::Bool(a), TycoValue::Bool(b)) => a == b,
+            (TycoValue::Int(a), TycoValue::Int(b)) => a == b,
+            (TycoValue::Float(a), TycoValue::Float(b)) => (*a - *b).abs() < f64::EPSILON,
+            (TycoValue::String(a), TycoValue::String(b)) => a.value == b.value,
+            (TycoValue::Date(a), TycoValue::Date(b))
+            | (TycoValue::Time(a), TycoValue::Time(b))
+            | (TycoValue::DateTime(a), TycoValue::DateTime(b)) => a == b,
+            _ => false,
+        }
+    }
+
     pub fn render_templates(&mut self, ctx: &TycoContext, current: Option<&TycoInstance>) {
         match self {
             TycoValue::String(s) => s.render(ctx, current),

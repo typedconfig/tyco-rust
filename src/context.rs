@@ -15,6 +15,7 @@ pub struct FieldSchema {
     pub is_nullable: bool,
     pub is_array: bool,
     pub default_value: Option<TycoValue>,
+    pub enum_choices: Option<Vec<TycoValue>>,
 }
 
 impl FieldSchema {
@@ -26,6 +27,7 @@ impl FieldSchema {
             is_nullable: false,
             is_array: false,
             default_value: None,
+            enum_choices: None,
         }
     }
 }
@@ -99,7 +101,35 @@ impl TycoStruct {
             .iter_mut()
             .find(|field| field.name == field_name)
             .ok_or_else(|| TycoError::parse(format!("Unknown field '{field_name}'")))?;
-        field.default_value = value;
+        match value {
+            Some(v) => {
+                field.default_value = Some(v);
+                field.enum_choices = None;
+            }
+            None => {
+                if field.enum_choices.is_some() {
+                    return Err(TycoError::parse(format!(
+                        "Field '{field_name}' previously set as an enum; cannot set it to empty"
+                    )));
+                }
+                field.default_value = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_enum_choices(
+        &mut self,
+        field_name: &str,
+        choices: Vec<TycoValue>,
+    ) -> Result<(), TycoError> {
+        let field = self
+            .fields
+            .iter_mut()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| TycoError::parse(format!("Unknown field '{field_name}'")))?;
+        field.enum_choices = Some(choices);
+        field.default_value = None;
         Ok(())
     }
 
@@ -255,7 +285,23 @@ impl TycoContext {
             for field in schema.fields() {
                 if let Some(value) = instance.remove_attribute(&field.name) {
                     let coerced = coerce_value(value, field)?;
+                    if let Some(choices) = &field.enum_choices {
+                        if !value_matches_enum(&coerced, choices) {
+                            return Err(TycoError::parse(format!(
+                                "Field '{}' enum value '{}' not in choices {}",
+                                field.name,
+                                coerced.to_template_text(),
+                                format_enum_choices(choices)
+                            )));
+                        }
+                    }
                     instance.set_attribute(field.name.clone(), coerced);
+                } else if field.enum_choices.is_some() {
+                    return Err(TycoError::parse(format!(
+                        "Field '{}' enum value not set for struct '{}'",
+                        field.name,
+                        schema.name()
+                    )));
                 } else if let Some(default) = &field.default_value {
                     instance.set_attribute(field.name.clone(), default.clone());
                 }
@@ -411,4 +457,16 @@ impl TycoContext {
     pub fn to_object(&self) -> JsonValue {
         self.to_json()
     }
+}
+
+fn value_matches_enum(value: &TycoValue, choices: &[TycoValue]) -> bool {
+    choices.iter().any(|choice| value.value_equals(choice))
+}
+
+fn format_enum_choices(choices: &[TycoValue]) -> String {
+    let rendered = choices
+        .iter()
+        .map(|choice| choice.to_template_text())
+        .collect::<Vec<_>>();
+    format!("({})", rendered.join(", "))
 }

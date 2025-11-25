@@ -29,6 +29,45 @@ pub fn has_unclosed_delimiter(line: &str, delimiter: &str) -> bool {
     }
 }
 
+pub fn has_unclosed_parentheses(text: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_quotes = false;
+    let mut quote_char = '\0';
+    let mut escape = false;
+
+    for ch in text.chars() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_quotes {
+            if ch == '\\' {
+                escape = true;
+                continue;
+            }
+            if ch == quote_char {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                in_quotes = true;
+                quote_char = ch;
+            }
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    depth > 0
+}
+
 pub fn split_top_level(input: &str, delimiter: char) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();

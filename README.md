@@ -14,7 +14,7 @@ use tyco_rust::{load, TycoError};
 
 fn main() -> Result<(), TycoError> {
     let context = load("tyco/example.tyco")?;
-    let document = context.to_object();
+    let document = context.as_object();
 
     let timezone = document["timezone"].as_str().unwrap_or_default();
     println!("timezone={timezone}");
@@ -41,8 +41,9 @@ fn main() -> Result<(), TycoError> {
 ```
 
 Run the parser against other files with `tyco_rust::loads(&content)`; both entrypoints return a
-fully-rendered `TycoContext`, so calling `to_object()` (or the legacy `to_json()`) yields the same structure as the Python
-example.
+fully-rendered `TycoContext`, so calling `as_object()` (or the legacy helpers) yields the same structure as the Python
+example. Use `context.as_json()` for a `serde_json::Value`, or `context.dumps_json(true)` /
+`context.dump_json(path, true)` for string/file output.
 
 ## Testing
 

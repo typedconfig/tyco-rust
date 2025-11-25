@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io::{self, Write};
 
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
@@ -428,7 +428,7 @@ impl TycoContext {
         }
     }
 
-    pub fn to_json(&self) -> JsonValue {
+    pub fn as_json(&self) -> JsonValue {
         let mut map = serde_json::Map::new();
         for (name, value) in self.globals.iter() {
             map.insert(name.clone(), value.to_json_value());
@@ -454,8 +454,31 @@ impl TycoContext {
         JsonValue::Object(map)
     }
 
+    pub fn as_object(&self) -> JsonValue {
+        self.as_json()
+    }
+
+    #[deprecated(since = "0.1.0", note = "Use as_json() instead")]
+    pub fn to_json(&self) -> JsonValue {
+        self.as_json()
+    }
+
+    #[deprecated(since = "0.1.0", note = "Use as_object() instead")]
     pub fn to_object(&self) -> JsonValue {
-        self.to_json()
+        self.as_object()
+    }
+
+    pub fn dumps_json(&self, pretty: bool) -> String {
+        if pretty {
+            serde_json::to_string_pretty(&self.as_json()).expect("Failed to serialize context")
+        } else {
+            serde_json::to_string(&self.as_json()).expect("Failed to serialize context")
+        }
+    }
+
+    pub fn dump_json<W: Write>(&self, mut writer: W, pretty: bool) -> io::Result<()> {
+        let data = self.dumps_json(pretty);
+        writer.write_all(data.as_bytes())
     }
 }
 

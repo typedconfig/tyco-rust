@@ -44,7 +44,7 @@ fn canonical_suite() {
         let context = parser
             .parse_file(&input)
             .unwrap_or_else(|e| panic!("Failed to parse {name}: {e}"));
-        let actual_json = context.to_json();
+        let actual_json = context.as_json();
         let expected_json: Value = serde_json::from_str(
             &fs::read_to_string(&expected_path)
                 .unwrap_or_else(|e| panic!("Cannot read expected {name}: {e}")),
